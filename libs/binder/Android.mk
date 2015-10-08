@@ -40,13 +40,18 @@ LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 LOCAL_LDLIBS += -lpthread
 LOCAL_MODULE := libbinder
-LOCAL_SHARED_LIBRARIES := liblog libcutils libutils
+LOCAL_SHARED_LIBRARIES := liblog libcutils libutils libshadowvm
 LOCAL_SRC_FILES := $(sources)
+LOCAL_C_INCLUDES += \
+	external/ShadowVMLibrary
 include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_LDLIBS += -lpthread
 LOCAL_MODULE := libbinder
 LOCAL_STATIC_LIBRARIES += libutils
+LOCAL_SHARED_LIBRARIES += libshadowvm
 LOCAL_SRC_FILES := $(sources)
+LOCAL_C_INCLUDES += \
+	external/ShadowVMLibrary
 include $(BUILD_STATIC_LIBRARY)

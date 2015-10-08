@@ -97,6 +97,13 @@ private:
                                                      int32_t handle,
                                                      uint32_t code,
                                                      const Parcel& data,
+                                                     status_t* statusBuffer,
+                                                     char* &bufferToFree);
+            status_t            writeTransactionData(int32_t cmd,
+                                                     uint32_t binderFlags,
+                                                     int32_t handle,
+                                                     uint32_t code,
+                                                     const Parcel& data,
                                                      status_t* statusBuffer);
             status_t            getAndExecuteCommand();
             status_t            executeCommand(int32_t command);
@@ -122,6 +129,12 @@ private:
             uid_t               mCallingUid;
             int32_t             mStrictModePolicy;
             int32_t             mLastTransactionBinderFlags;
+
+            int                 session_transaction_id;
+            int                 local_transaction_cnt;
+            int                 session_pid;
+            int                 session_tid;
+            int                 threadIdx;
 };
 
 }; // namespace android

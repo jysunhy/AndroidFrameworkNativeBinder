@@ -17,6 +17,12 @@
 #define LOG_TAG "Binder"
 #include <cutils/log.h>
 
+struct binder_session{
+    int transaction_id;
+    int pid;
+    int tid;
+}session;
+
 void bio_init_from_txn(struct binder_io *io, struct binder_txn *txn);
 
 #if TRACE
@@ -157,6 +163,27 @@ int binder_write(struct binder_state *bs, void *data, unsigned len)
     return res;
 }
 
+static int SVM_FLAG=123456789;
+
+void pack_svm_data (struct binder_txn* txn, int pid, int tid, int transaction_id) {
+    int* tail = (int*)(((char*)(txn->data))+txn->data_size);
+    tail[0] = pid;
+    tail[1] = tid;
+    tail[2] = transaction_id;
+    tail[3] = SVM_FLAG;
+    txn->data_size += 4*sizeof(int);
+}
+void unpack_svm_data (struct binder_txn* txn, int* pid, int* tid, int* transaction_id) {
+    int* tail = (int*)(((char*)(txn->data))+txn->data_size-4*sizeof(int));
+    if(tail[3] != SVM_FLAG){
+    }else{
+        *pid = tail[0];
+        *tid = tail[1];
+        *transaction_id = tail[2];
+        txn->data_size -= 4*sizeof(int);
+    }
+}
+
 void binder_send_reply(struct binder_state *bs,
                        struct binder_io *reply,
                        void *buffer_to_free,
@@ -187,6 +214,7 @@ void binder_send_reply(struct binder_state *bs,
         data.txn.offs_size = ((char*) reply->offs) - ((char*) reply->offs0);
         data.txn.data = reply->data0;
         data.txn.offs = reply->offs0;
+        pack_svm_data(&data.txn, getpid(), 1, session.transaction_id);
     }
     binder_write(bs, &data, sizeof(data));
 }
@@ -222,9 +250,11 @@ int binder_parse(struct binder_state *bs, struct binder_io *bio,
                 ALOGE("parse: txn too small!\n");
                 return -1;
             }
+            session.transaction_id = -1;
+            unpack_svm_data(txn, &session.pid, &session.tid, &session.transaction_id);
             binder_dump_txn(txn);
             if (func) {
-                unsigned rdata[256/4];
+                unsigned rdata[256/4+4];
                 struct binder_io msg;
                 struct binder_io reply;
                 int res;
@@ -239,10 +269,14 @@ int binder_parse(struct binder_state *bs, struct binder_io *bio,
         }
         case BR_REPLY: {
             struct binder_txn *txn = (void*) ptr;
+            int pid, tid, transaction_id;
             if ((end - ptr) * sizeof(uint32_t) < sizeof(struct binder_txn)) {
                 ALOGE("parse: reply too small!\n");
                 return -1;
             }
+
+            unpack_svm_data(txn, &pid, &tid, &transaction_id);
+
             binder_dump_txn(txn);
             if (bio) {
                 bio_init_from_txn(bio, txn);
@@ -299,9 +333,26 @@ void binder_link_to_death(struct binder_state *bs, void *ptr, struct binder_deat
     binder_write(bs, cmd, sizeof(cmd));
 }
 
+void expand_bio(struct binder_io* msg, struct binder_io* res) {
+    int ori_data_size = msg->data-msg->data0;
+    int ori_off_size = (msg->offs-msg->offs0)*sizeof(int);
+    int ori_buf_len = ori_data_size+msg->data_avail+ori_off_size+msg->offs_avail*sizeof(int);
+    int new_buf_len = ori_buf_len+4*sizeof(int);
+    char* data = (char*)malloc(new_buf_len);
+    bio_init(res, data, sizeof(data), ori_off_size/sizeof(int)+msg->offs_avail);
+    res->flags = msg->flags;
+    res->unused = msg->unused;
+    memcpy(res->offs0, msg->offs0, ori_off_size);
+    res->offs_avail = msg->offs_avail;
+    res->offs = res->offs0 + (msg->offs-msg->offs0);
+
+    memcpy(res->data0, msg->data0, ori_data_size);
+    res->data_avail = msg->data_avail+4*sizeof(int);
+    res->data = res->data0 + ori_data_size;
+}
 
 int binder_call(struct binder_state *bs,
-                struct binder_io *msg, struct binder_io *reply,
+                struct binder_io *msg_ori, struct binder_io *reply,
                 void *target, uint32_t code)
 {
     int res;
@@ -311,12 +362,14 @@ int binder_call(struct binder_state *bs,
         struct binder_txn txn;
     } writebuf;
     unsigned readbuf[32];
+    struct binder_io* msg = (struct binder_io*)malloc(sizeof(struct binder_io));
+    expand_bio(msg_ori, msg);
 
     if (msg->flags & BIO_F_OVERFLOW) {
         fprintf(stderr,"binder: txn buffer overflow\n");
         goto fail;
     }
-
+    
     writebuf.cmd = BC_TRANSACTION;
     writebuf.txn.target = target;
     writebuf.txn.code = code;
@@ -329,6 +382,9 @@ int binder_call(struct binder_state *bs,
     bwr.write_size = sizeof(writebuf);
     bwr.write_consumed = 0;
     bwr.write_buffer = (unsigned) &writebuf;
+
+    static local_transaction_cnt = 0;
+    pack_svm_data(&writebuf.txn, getpid(), 1, ++local_transaction_cnt);
     
     hexdump(msg->data0, msg->data - msg->data0);
     for (;;) {
@@ -344,11 +400,17 @@ int binder_call(struct binder_state *bs,
         }
 
         res = binder_parse(bs, reply, readbuf, bwr.read_consumed, 0);
-        if (res == 0) return 0;
+        if (res == 0) {
+            free(msg->offs0);
+            free(msg);
+            return 0;
+        }
         if (res < 0) goto fail;
     }
 
 fail:
+    free(msg->offs0);
+    free(msg);
     memset(reply, 0, sizeof(*reply));
     reply->flags |= BIO_F_IOERROR;
     return -1;

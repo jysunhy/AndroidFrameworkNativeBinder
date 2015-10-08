@@ -16,6 +16,9 @@
 
 #define LOG_TAG "IPCThreadState"
 
+#define SVM_FLAG 123456789
+
+#include "interface/ShadowVMInterface.h"
 #include <binder/IPCThreadState.h>
 
 #include <binder/Binder.h>
@@ -67,7 +70,6 @@
 #endif
 
 // ---------------------------------------------------------------------------
-
 namespace android {
 
 static const char* getReturnString(size_t idx);
@@ -548,6 +550,7 @@ status_t IPCThreadState::transact(int32_t handle,
                                   Parcel* reply, uint32_t flags)
 {
     status_t err = data.errorCheck();
+    char * bufferToFree = NULL;
 
     flags |= TF_ACCEPT_FDS;
 
@@ -561,11 +564,12 @@ status_t IPCThreadState::transact(int32_t handle,
     if (err == NO_ERROR) {
         LOG_ONEWAY(">>>> SEND from pid %d uid %d %s", getpid(), getuid(),
             (flags & TF_ONE_WAY) == 0 ? "READ REPLY" : "ONE WAY");
-        err = writeTransactionData(BC_TRANSACTION, flags, handle, code, data, NULL);
+        err = writeTransactionData(BC_TRANSACTION, flags, handle, code, data, NULL, bufferToFree);
     }
     
     if (err != NO_ERROR) {
         if (reply) reply->setError(err);
+        if (bufferToFree) delete []bufferToFree;
         return (mLastError = err);
     }
     
@@ -601,6 +605,7 @@ status_t IPCThreadState::transact(int32_t handle,
     } else {
         err = waitForResponse(NULL, NULL);
     }
+    if (bufferToFree) delete []bufferToFree;
     
     return err;
 }
@@ -679,12 +684,17 @@ IPCThreadState::IPCThreadState()
     : mProcess(ProcessState::self()),
       mMyThreadId(androidGetTid()),
       mStrictModePolicy(0),
-      mLastTransactionBinderFlags(0)
+      mLastTransactionBinderFlags(0),
+      local_transaction_cnt(0)
 {
     pthread_setspecific(gTLS, this);
     clearCaller();
     mIn.setDataCapacity(256);
     mOut.setDataCapacity(256);
+
+    static int local_thread_id = 0;
+    threadIdx = ++local_thread_id;
+    session_transaction_id = -1;
 }
 
 IPCThreadState::~IPCThreadState()
@@ -693,12 +703,19 @@ IPCThreadState::~IPCThreadState()
 
 status_t IPCThreadState::sendReply(const Parcel& reply, uint32_t flags)
 {
+    status_t res;
     status_t err;
     status_t statusBuffer;
-    err = writeTransactionData(BC_REPLY, flags, -1, 0, reply, &statusBuffer);
-    if (err < NO_ERROR) return err;
+    char* bufferToFree = NULL;
+    err = writeTransactionData(BC_REPLY, flags, -1, 0, reply, &statusBuffer, bufferToFree);
+    if (err < NO_ERROR) {
+        if(bufferToFree) delete []bufferToFree;
+        return err;
+    }
     
-    return waitForResponse(NULL, NULL);
+    res = waitForResponse(NULL, NULL);
+    if(bufferToFree) delete []bufferToFree;
+    return res;
 }
 
 status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
@@ -748,11 +765,19 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
                 ALOG_ASSERT(err == NO_ERROR, "Not enough command data for brREPLY");
                 if (err != NO_ERROR) goto finish;
 
+                int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
+                int diffsize = svmData[3] == SVM_FLAG? 4*sizeof(int):0;
+                if(svmData[3] != SVM_FLAG){
+                    svmBinderOnResponseReceived(getpid(), threadIdx, local_transaction_cnt, -1, -1, tr.flags & TF_ONE_WAY);
+                }else {
+                    svmBinderOnResponseReceived(getpid(), threadIdx, svmData[2], svmData[0], svmData[1], tr.flags & TF_ONE_WAY);
+                    //ALOG(LOG_DEBUG,"HAIYANG", "%d %d %s", local_transaction_cnt, svmData[2], local_transaction_cnt==svmData[2]?"":"ERROR");
+                }
                 if (reply) {
                     if ((tr.flags & TF_STATUS_CODE) == 0) {
                         reply->ipcSetDataReference(
                             reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
-                            tr.data_size,
+                            tr.data_size-diffsize,
                             reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
                             tr.offsets_size/sizeof(size_t),
                             freeBuffer, this);
@@ -896,6 +921,15 @@ status_t IPCThreadState::talkWithDriver(bool doReceive)
 status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
     int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
 {
+    char *bufferToFree = NULL;
+    status_t res = writeTransactionData(cmd, binderFlags, handle, code, data, statusBuffer, bufferToFree);
+    if(bufferToFree != NULL) {
+        delete[]bufferToFree;
+    }
+    return res;
+}
+status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
+    int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer, char* &bufferToFree) {
     binder_transaction_data tr;
 
     tr.target.handle = handle;
@@ -907,10 +941,33 @@ status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
     
     const status_t err = data.errorCheck();
     if (err == NO_ERROR) {
-        tr.data_size = data.ipcDataSize();
-        tr.data.ptr.buffer = data.ipcData();
-        tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
-        tr.data.ptr.offsets = data.ipcObjects();
+        if(cmd == BC_REPLY && session_transaction_id < 0) {
+            //ALOG(LOG_DEBUG,"HAIYANG","receive transaction from unknown sender");
+            tr.data_size = data.ipcDataSize();
+            tr.data.ptr.buffer = data.ipcData();
+            tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
+            tr.data.ptr.offsets = data.ipcObjects();
+        }else {
+            int pid=getpid(), tid=threadIdx, transaction_id=-1;
+            if(cmd==BC_TRANSACTION){
+                transaction_id = ++local_transaction_cnt;
+                tid = svmBinderOnRequestSent(pid, tid, transaction_id, binderFlags & TF_ONE_WAY);
+            }else if(cmd==BC_REPLY){
+                transaction_id = session_transaction_id;
+                tid = svmBinderOnResponseSent(session_pid, session_tid, transaction_id, pid, tid, binderFlags & TF_ONE_WAY);
+            }
+            tr.data_size = data.ipcDataSize()+4*sizeof(int);
+            bufferToFree = new char[tr.data_size];
+            memcpy(bufferToFree, data.ipcData(), data.ipcDataSize());
+            int* svmData = (int*)(bufferToFree+data.ipcDataSize());
+            svmData[0] = pid;
+            svmData[1] = tid;
+            svmData[2] = transaction_id;
+            svmData[3] = SVM_FLAG;
+            tr.data.ptr.buffer = bufferToFree;
+            tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
+            tr.data.ptr.offsets = data.ipcObjects();
+        }
     } else if (statusBuffer) {
         tr.flags |= TF_STATUS_CODE;
         *statusBuffer = err;
@@ -1023,12 +1080,26 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
             if (result != NO_ERROR) break;
             
             Parcel buffer;
+            session_transaction_id = -1;
+
+            int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
+            int diffsize = 0;
+            if(svmData[3] == SVM_FLAG){
+                session_pid = svmData[0];
+                session_tid = svmData[1];
+                session_transaction_id = svmData[2];
+                diffsize = 4*sizeof(int);
+                svmBinderOnRequestReceived(svmData[0], svmData[1], svmData[2], getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+            }else if(!(tr.flags & TF_ONE_WAY)){
+                //ALOG(LOG_DEBUG, "HAIYANG", "BAD FLAG");
+                svmBinderOnRequestReceived(0, 1, 0, getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+            }
             buffer.ipcSetDataReference(
                 reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
-                tr.data_size,
+                tr.data_size-diffsize,
                 reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
                 tr.offsets_size/sizeof(size_t), freeBuffer, this);
-            
+
             const pid_t origPid = mCallingPid;
             const uid_t origUid = mCallingUid;
             
