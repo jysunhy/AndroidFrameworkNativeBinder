@@ -16,7 +16,8 @@
 
 #define LOG_TAG "IPCThreadState"
 
-#define SVM_FLAG 123456789
+#define SVM_FLAG 0xffff
+#define SVM_EMPTY 0xfff0
 
 #include "interface/ShadowVMInterface.h"
 #include <binder/IPCThreadState.h>
@@ -766,8 +767,8 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
                 if (err != NO_ERROR) goto finish;
 
                 int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
-                int diffsize = svmData[3] == SVM_FLAG? 4*sizeof(int):0;
-                if(svmData[3] != SVM_FLAG){
+                int diffsize = ((svmData[3] & SVM_EMPTY) == SVM_EMPTY) ? 4*sizeof(int):0;
+                if((svmData[3]&SVM_EMPTY) != SVM_EMPTY){
                     svmBinderOnResponseReceived(getpid(), threadIdx, local_transaction_cnt, -1, -1, tr.flags & TF_ONE_WAY);
                 }else {
                     svmBinderOnResponseReceived(getpid(), threadIdx, svmData[2], svmData[0], svmData[1], tr.flags & TF_ONE_WAY);
@@ -963,7 +964,7 @@ status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
             svmData[0] = pid;
             svmData[1] = tid;
             svmData[2] = transaction_id;
-            svmData[3] = SVM_FLAG;
+            svmData[3] = (*pGetIPCFlag)()?SVM_FLAG:SVM_EMPTY;
             tr.data.ptr.buffer = bufferToFree;
             tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
             tr.data.ptr.offsets = data.ipcObjects();
@@ -1084,7 +1085,7 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
 
             int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
             int diffsize = 0;
-            if(svmData[3] == SVM_FLAG){
+            if((svmData[3]&SVM_EMPTY) == SVM_EMPTY){
                 session_pid = svmData[0];
                 session_tid = svmData[1];
                 session_transaction_id = svmData[2];
