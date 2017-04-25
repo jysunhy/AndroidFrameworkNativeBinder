@@ -16,10 +16,9 @@
 
 #define LOG_TAG "IPCThreadState"
 
-#define SVM_FLAG 0xffff
-#define SVM_EMPTY 0xfff0
+#define SVM_FLAG 0xabc00000
 
-#include "interface/ShadowVMInterface.h"
+#include "binder/hook.h"
 #include <binder/IPCThreadState.h>
 
 #include <binder/Binder.h>
@@ -77,6 +76,10 @@ static const char* getReturnString(size_t idx);
 static const char* getCommandString(size_t idx);
 static const void* printReturnCommand(TextOutput& out, const void* _cmd);
 static const void* printCommand(TextOutput& out, const void* _cmd);
+
+int validFlag(int flag){
+    return (flag != 0xffffffff) && ((flag & SVM_FLAG) == SVM_FLAG);
+}
 
 // This will result in a missing symbol failure if the IF_LOG_COMMANDS()
 // conditionals don't get stripped...  but that is probably what we want.
@@ -767,11 +770,13 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
                 if (err != NO_ERROR) goto finish;
 
                 int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
-                int diffsize = ((svmData[3] & SVM_EMPTY) == SVM_EMPTY) ? 4*sizeof(int):0;
-                if((svmData[3]&SVM_EMPTY) != SVM_EMPTY){
-                    svmBinderOnResponseReceived(getpid(), threadIdx, local_transaction_cnt, -1, -1, tr.flags & TF_ONE_WAY);
+                int diffsize = validFlag(svmData[3])? 4*sizeof(int):0;
+                if(!validFlag(svmData[3])) {
+                    //svmBinderOnResponseReceived(getpid(), threadIdx, local_transaction_cnt, -1, -1, tr.flags & TF_ONE_WAY);
+                    binder_hook(5, 0, getpid(), pGetCurrentThreadId(), local_transaction_cnt, tr.flags & TF_ONE_WAY, -1, -1);
                 }else {
-                    svmBinderOnResponseReceived(getpid(), threadIdx, svmData[2], svmData[0], svmData[1], tr.flags & TF_ONE_WAY);
+                    binder_hook(5, svmData[3] ^ SVM_FLAG, getpid(), pGetCurrentThreadId(), local_transaction_cnt, tr.flags & TF_ONE_WAY, svmData[0], svmData[1]);
+                    //svmBinderOnResponseReceived(getpid(), threadIdx, svmData[2], svmData[0], svmData[1], tr.flags & TF_ONE_WAY);
                     //ALOG(LOG_DEBUG,"HAIYANG", "%d %d %s", local_transaction_cnt, svmData[2], local_transaction_cnt==svmData[2]?"":"ERROR");
                 }
                 if (reply) {
@@ -950,12 +955,15 @@ status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
             tr.data.ptr.offsets = data.ipcObjects();
         }else {
             int pid=getpid(), tid=threadIdx, transaction_id=-1;
+            tid = pGetCurrentThreadId();
             if(cmd==BC_TRANSACTION){
                 transaction_id = ++local_transaction_cnt;
-                tid = svmBinderOnRequestSent(pid, tid, transaction_id, binderFlags & TF_ONE_WAY);
+                //tid = svmBinderOnRequestSent(pid, tid, transaction_id, binderFlags & TF_ONE_WAY);
+                binder_hook(0, pGetIPCFlag(), pid, tid, local_transaction_cnt, tr.flags & TF_ONE_WAY, -1, -1);
             }else if(cmd==BC_REPLY){
                 transaction_id = session_transaction_id;
-                tid = svmBinderOnResponseSent(session_pid, session_tid, transaction_id, pid, tid, binderFlags & TF_ONE_WAY);
+                //tid = svmBinderOnResponseSent(session_pid, session_tid, transaction_id, pid, tid, binderFlags & TF_ONE_WAY);
+                binder_hook(3, pGetIPCFlag(), session_pid, session_tid, session_transaction_id, tr.flags & TF_ONE_WAY, pid, tid);
             }
             tr.data_size = data.ipcDataSize()+4*sizeof(int);
             bufferToFree = new char[tr.data_size];
@@ -964,7 +972,7 @@ status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
             svmData[0] = pid;
             svmData[1] = tid;
             svmData[2] = transaction_id;
-            svmData[3] = (*pGetIPCFlag)()?SVM_FLAG:SVM_EMPTY;
+            svmData[3] = SVM_FLAG | pGetIPCFlag();
             tr.data.ptr.buffer = bufferToFree;
             tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
             tr.data.ptr.offsets = data.ipcObjects();
@@ -982,6 +990,7 @@ status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
     
     mOut.writeInt32(cmd);
     mOut.write(&tr, sizeof(tr));
+    binder_hook(4, pGetIPCFlag(), session_pid, session_tid, session_transaction_id, tr.flags & TF_ONE_WAY, getpid(), pGetCurrentThreadId());
     
     return NO_ERROR;
 }
@@ -1085,15 +1094,19 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
 
             int* svmData = (int*)(((char*)(tr.data.ptr.buffer))+tr.data_size-4*sizeof(int));
             int diffsize = 0;
-            if((svmData[3]&SVM_EMPTY) == SVM_EMPTY){
+            if(validFlag(svmData[3])) {
                 session_pid = svmData[0];
                 session_tid = svmData[1];
                 session_transaction_id = svmData[2];
                 diffsize = 4*sizeof(int);
-                svmBinderOnRequestReceived(svmData[0], svmData[1], svmData[2], getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+                //svmBinderOnRequestReceived(svmData[0], svmData[1], svmData[2], getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+                binder_hook(1, pGetIPCFlag(), svmData[0], svmData[1], svmData[2], tr.flags & TF_ONE_WAY, getpid(), pGetCurrentThreadId());
+                binder_hook(2, svmData[3] ^ SVM_FLAG, svmData[0], svmData[1], svmData[2], tr.flags & TF_ONE_WAY, getpid(), pGetCurrentThreadId());
             }else if(!(tr.flags & TF_ONE_WAY)){
                 //ALOG(LOG_DEBUG, "HAIYANG", "BAD FLAG");
-                svmBinderOnRequestReceived(0, 1, 0, getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+                //svmBinderOnRequestReceived(0, 1, 0, getpid(), threadIdx, tr.flags & TF_ONE_WAY);
+                binder_hook(1, pGetIPCFlag(), svmData[0], svmData[1], svmData[2], tr.flags & TF_ONE_WAY, getpid(), pGetCurrentThreadId());
+                binder_hook(2, 0, -1, -1, -1, tr.flags & TF_ONE_WAY, getpid(), pGetCurrentThreadId());
             }
             buffer.ipcSetDataReference(
                 reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),

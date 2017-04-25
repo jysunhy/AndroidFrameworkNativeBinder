@@ -163,20 +163,19 @@ int binder_write(struct binder_state *bs, void *data, unsigned len)
     return res;
 }
 
-static int SVM_FLAG=0xffff;
-static int SVM_EMPTY=0xfff0;
+static int SVM_FLAG=0xabc00000;
 
 void pack_svm_data (struct binder_txn* txn, int pid, int tid, int transaction_id) {
     int* tail = (int*)(((char*)(txn->data))+txn->data_size);
     tail[0] = pid;
     tail[1] = tid;
     tail[2] = transaction_id;
-    tail[3] = SVM_EMPTY;//SVM_FLAG;
+    tail[3] = SVM_FLAG;
     txn->data_size += 4*sizeof(int);
 }
 void unpack_svm_data (struct binder_txn* txn, int* pid, int* tid, int* transaction_id) {
     int* tail = (int*)(((char*)(txn->data))+txn->data_size-4*sizeof(int));
-    if((tail[3] & SVM_EMPTY) != SVM_EMPTY){
+    if(((tail[3] & SVM_FLAG) != SVM_FLAG) || (tail[3] == 0xffffffff)){
     }else{
         *pid = tail[0];
         *tid = tail[1];
